@@ -1243,6 +1243,7 @@ var url = {
   'stock': '{{domainURL}}/p/230677{{stockid}}',
   'topic': '{{domainURL}}/k/{{topic}}',
   'list_group': '{{domainURL}}/aj/f/group/list',
+  'group_feeds': '{{domainURL}}/aj/mblog/fsearch?{{param}}',
 };
 
 var font = {
@@ -2680,7 +2681,7 @@ network.buffered = (function () {
 
 // 获取用户的关注分组情况
 network.group = function (callback) {
-  util.xhr({
+  return util.xhr({
     'method': 'GET',
     'url': util.str.fill(url.list_group),
     'onload': function (resp) {
@@ -2948,6 +2949,14 @@ network.suggest.user = network.suggest.base(function (query, callback) {
   };
 }, function (x) { return x.replace(/^@/, ''); }, []);
 
+network.suggest.group = network.suggest.base(function (query, callback) {
+  return network.group(function (groups) {
+    var names = groups.map(function (group) { return group.name; });
+    var matches = names.filter(function (group) { return group.indexOf(query.trim()) !== -1; })
+    callback(matches);
+  });
+}, function (x) { return x; });
+
 // 推荐话题
 network.suggest.topic = network.suggest.base(function (query, callback) {
   return util.xhr({
@@ -3180,6 +3189,52 @@ network.following = (function () {
       var busy = !xhr;
       if (busy) setTimeout(getNextPage, 10e3);
     }());
+  };
+}());
+
+network.feed = {};
+network.feed.group = (function () {
+  var getFeeds = function (data, callback) {
+    if (data.loading) return void callback([], data);
+    data.loading = true;
+    var param = JSON.parse(JSON.stringify(data.param)), lastPage = null;
+    param.gid = data.gid;
+    if (data.pages.length) {
+      lastPage = data.pages[data.pages.length - 1];
+      if (lastPage.length === 0) {
+        callback([], function empty(callback) { callback([], empty); });
+      }
+      param.min_id = lastPage[0].mid;
+      param.end_id = lastPage[lastPage.length - 1].mid;
+    }
+    util.xhr({
+      method: 'GET',
+      url: util.str.fill(url.group_feeds, { param: util.str.toquery(param) }),
+      onload: function (resp) {
+        data.loading = false;
+        var response = JSON.parse(resp.responseText);
+        var list = util.dom.create('div', response.data);
+        var items = Array.from(list.querySelectorAll('.WB_feed_type[mid]'));
+        var feeds = items.map(function (item) {
+          var dateitem = item.querySelector('[node-type="feed_list_item_date"][date]');
+          if (!dateitem) return null;
+          var date = Number(dateitem.getAttribute('date'));
+          var mid = item.getAttribute('mid');
+          return { date: date, mid: mid, dom: item.cloneNode(true), }
+        }).filter(util.func.identity);
+        data.pages.push(feeds);
+        callback(feeds.slice(0), function (callback) { getFeeds(data, callback); });
+      },
+      onerror: function () {
+        data.loading = false;
+        callback([], function empty(callback) { callback([], empty); });
+      }
+    });
+  };
+  return function (gid, param, callback) {
+    var data = { gid: gid, param: param, pages: [], feeds: {}, loading: false };
+    data.next = function (callback) { getFeed(data, callback); };
+    getFeeds(data, callback);
   };
 }());
 
@@ -3737,6 +3792,7 @@ filter.typed.config = (function () {
     'strings': itemsConfig,
     'boolean': baseConfig(Boolean),
     'users': itemsConfig,
+    'groups': itemsConfig,
     'number': baseConfig(Number),
     'range': baseConfig(Number),
     'select': baseConfig(String),
@@ -3753,6 +3809,7 @@ util.complete = (function () {
   var enable = function () { enabled = true; };
   var types = {
     'user': network.suggest.user,
+    'group': network.suggest.group,
     'topic': network.suggest.topic,
   };
   var timeout = null, shown = '';
@@ -4045,7 +4102,7 @@ filter.typed.dom = (function () {
       'outer': outer,
       'binder': function (dom, item) {
         var form = dom.querySelector('form');
-        var input = dom.querySelector('input');
+        var input = dom.querySelector('input[type="text"]');
         var ul = dom.querySelector('ul.yawf-configItems');
         var shown = {};
         // 将某个已经有的字符串显示到末尾
@@ -4096,23 +4153,23 @@ filter.typed.dom = (function () {
     else callback(str, util.dom.create('ul', util.str.fill(html.configStringsItem, { 'item': item.display ? item.display(str) : str })).firstChild);
   });
 
+  // 提示用户不存在的对话框
+  var showUserNotExistError = function (str) {
+    util.ui.alert('yawf-user-not-exist', {
+      'title': util.str.fill('{{accountNotExistErrorTitle}}'),
+      'text': util.str.fill('{{{accountNotExistError}}}', { 'name': util.str.escape.xml(str) }),
+      'icon': 'error'
+    });
+  };
   // 用户列表的设置项
   var users = items(html.configUsers, function (item, userinput, str, callback) {
-    var showUserNotExistError = function () {
-      util.ui.alert('yawf-user-not-exist', {
-        'title': util.str.fill('{{accountNotExistErrorTitle}}'),
-        'text': util.str.fill('{{{accountNotExistError}}}', { 'name': util.str.escape.xml(str) }),
-        'icon': 'error'
-      });
-      callback();
-    };
     if (userinput) {
       if (!(str = str.trim().replace(/^@/, ''))) return callback();
       network.account.name(str, function (info) {
-        if (!info) showUserNotExistError();
+        if (!info) { showUserNotExistError(str); callback(); }
         else if (item.add && !item.add(info)) callback();
         else callback(info.id, util.dom.create('ul', util.str.fill(html.configUsersItem, info)).firstChild);
-      }, showUserNotExistError);
+      }, function () { showUserNotExistError(str); });
     } else {
       var emptyInfo = { 'id': str, 'name': ' ', 'avatar': ' ' };
       var li = util.dom.create('ul', util.str.fill(html.configUsersItem, emptyInfo)).firstChild;
@@ -4122,6 +4179,36 @@ filter.typed.dom = (function () {
         u.setAttribute('uid', info.id); u.setAttribute('title', info.name); u.textContent = info.name;
         var p = li.querySelector('.pic img');
         p.src = info.avatar;
+      });
+    }
+  });
+
+  // 提示分组不存在的对话框
+  var showGroupNotExistError = function (str) {
+    util.ui.alert('yawf-group-not-exist', {
+      'title': util.str.fill('{{groupNotExistErrorTitle}}'),
+      'text': util.str.fill('{{{groupNotExistError}}}', { 'name': util.str.escape.xml(str) }),
+      'icon': 'error'
+    });
+    callback();
+  };
+  // 添加多个用户组
+  var groups = items(html.configStrings, function (item, userinput, str, callback) {
+    if (userinput) {
+      network.group(function (groups) {
+        var group = groups.filter(function (group) { return group.name === str; })[0];
+        if (!group) { showGroupNotExistError(str); callback(); }
+        else if (item.add && !item.add(info)) callback();
+        else callback(group.id, util.dom.create('ul', util.str.fill(html.configStringsItem, { 'item': item.display ? item.display(str) : str })).firstChild);
+      }, function () { showUserNotExistError(str); });
+    } else {
+      var emptyInfo = { 'id': str, 'name': ' ' };
+      var li = util.dom.create('ul', util.str.fill(html.configStringsItem, { 'item': '' })).firstChild;
+      callback(str, li);
+      network.group(function (groups) {
+        var group = groups.filter(function (group) { return group.id === str; })[0];
+        li.title = group.name;
+        li.appendChild(document.createTextNode(group.name));
       });
     }
   });
@@ -4206,6 +4293,7 @@ filter.typed.dom = (function () {
     'strings': strings,
     'boolean': bool,
     'users': users,
+    'groups': groups,
     'range': range,
     'key': key,
     'noui': noui,
@@ -5080,6 +5168,10 @@ filter.items.base.loadweibo.load_weibo_by_group = filter.item({
     'i': { 'type': 'sicon', 'icon': 'ask', 'text': '{{loadWeiboByGroupDesc}}' },
     'group': { 'type': 'noui', 'default': {} },
   },
+  'deactive': function () {
+    this.putconf(false);
+    this.ref.group.putconf({});
+  },
   'shown': function (dom) {
     var that = this;
     var chose = function (group) { that.ref.group.putconf(group); };
@@ -5100,6 +5192,7 @@ filter.items.base.loadweibo.load_weibo_by_group = filter.item({
             li.addEventListener('click', function () {
               chose(group); dialog.hide();
               that.putconf(true); show();
+              filter.items.base.loadweibo.load_weibo_by_multi_group.deactive();
             });
             ul.appendChild(li);
           });
@@ -5131,24 +5224,22 @@ filter.items.base.loadweibo.load_weibo_by_group = filter.item({
     show();
     button.addEventListener('click', askGroup);
   },
-  'ainit': function () {
-    var group = this.ref.group.conf;
-    if (!group || !group.id) { this.putconf(false); return; }
+  'gogroup': function (gid) {
     // 发现当前不是搜索，就跳转到搜索去
     var updateLocation = function redirectHomeWeiboUseGroup() {
       // 首页才需要 gid ，其他有些页面可能是因为从首页点过去的时候误带参数，需要特殊处理
       var homefeed = document.getElementById('v6_pl_content_homefeed');
       var nothomefeed = document.getElementById('v6_pl_content_commentlist') ||
         document.querySelector('[id^="Pl_Official_MyProfileFeed__"]');
-      if (!homefeed && !nothomefeed && !ismessage) return;
+      if (!homefeed && !nothomefeed) return;
       var a = util.dom.create('a', ''); a.href = location.href;
       // 检查是否添加了 gid 分组信息
       var query = util.str.parsequery(location.search.slice(1));
-      var has_gid = 'gid' in query && query.gid > 0;
+      var has_gid = 'gid' in query && Number(query.gid);
       var gid_needed = homefeed;
       if (!has_gid && gid_needed) {
         // 如果没有添加 gid 那么自动添上
-        query.gid = group.id;
+        query.gid = gid;
         a.search = '?' + util.str.toquery(query);
         location.replace(a.href);
       }
@@ -5163,11 +5254,152 @@ filter.items.base.loadweibo.load_weibo_by_group = filter.item({
       ].map(function (x) { return x + ':not([href*="is_search"])'; }).join(',')));
       links.forEach(function (l) {
         var s = util.str.parsequery(l.search.slice(1));
-        s.gid = group.id;
+        s.gid = gid;
         l.search = util.str.toquery(s);
       });
     };
     observer.dom.add(updateHomeLinksWithGid);
+  },
+  'ainit': function () {
+    var group = this.ref.group.conf;
+    if (!group || !group.id) { this.putconf(false); return; }
+    this.gogroup(group.id);
+  },
+}).addto(filter.groups.base);
+
+// 使用分组代替首页
+filter.items.base.loadweibo.load_weibo_by_multi_group = filter.item({
+  'group': 'loadweibo',
+  'version': 465,
+  'type': 'groups',
+  'complete': 'group',
+  'key': 'weibo.tool.load_weibo_by_multi_group',
+  'text': '{{<enabled>}}{{loadWeiboByMultiGroup}}{{<i>}}||{{loadWeiboByMultiGroupTitle}}',
+  'ref': {
+    'enabled': { 'type': 'boolean', 'default': false, },
+    'i': { 'type': 'sicon', 'icon': 'warn', 'text': '{{loadWeiboByMultiGroupDesc}}' },
+  },
+  'deactive': function () { this.ref.enabled.putconf(false); },
+  'init': function () {
+    const that = this;
+    // 和单分组替换功能互斥
+    util.config.onput(that.key, function (value) {
+      if (!value) return;
+      filter.items.base.loadweibo.load_weibo_by_group.deactive();
+    });
+    if (!that.ref.enabled.conf) return;
+    if (!that.conf || !that.conf.length) return;
+    // 先跳转到空白页面
+    filter.items.base.loadweibo.load_weibo_by_group.gogroup('-1');
+    // 自动检查当前是不是特定的基础界面，是的话开始这段××的逻辑
+    observer.dom.add(function checkMultiGroupPage() {
+      var query = util.str.parsequery(location.search.slice(1));
+      var gid = 'gid' in query && Number(query.gid);
+      if (gid !== -1) return;
+      var groups = that.conf;
+      if (!groups || !groups.length) return;
+      var placeholder = document.querySelector('.WB_feed > .WB_result_null');
+      if (!placeholder) return;
+      var feedlist = placeholder.parentNode;
+      feedlist.removeChild(placeholder);
+      feedlist.classList.add('WB_feed_v3');
+      feedlist.classList.add('WB_feed_v4');
+      var param = Object.assign({}, query); delete param.gid;
+      showFeeds(feedlist, groups, param);
+    });
+    // ××的逻辑
+    var showFeeds = function (feedlist, groups, param) {
+      var loading = groups.length;
+      util.debug('home feed generate: start');
+      // 初始化数据获取
+      var feedByGroup = Array(groups.length).fill(null);
+      groups.forEach(function (gid, index) {
+        util.debug('home feed generate: get data for %o', gid);
+        network.feed.group(gid, param, function (feeds, more) {
+          var info = feedByGroup[index] = {
+            gid: gid,
+            feeds: feeds.map(function (feed) {
+              return Object.assign(feed, { error: false });
+            }),
+            more: feeds.length ? more : null,
+            errors: Math.ceil(feeds.length / 2), // 对分组内能容忍的最大乱序微博数量
+          };
+          checkOrder(info);
+          util.debug('home feed generate: got data for %o %o', gid, info);
+          if (!--loading) nextFeed(100);
+        });
+      });
+      // 检查拿到的数据是否是正常顺序的
+      // 如果顺序不正确，就试着多拿一些数据
+      var checkOrder = function (info) {
+        info.feeds.forEach(function (feed, index) {
+          if (feed.error) return;
+          var newer = info.feeds.slice(index + 1).filter(function (next) {
+            return +feed.date < +next.date;
+          });
+          if (!newer.length) return;
+          feed.error = true;
+          info.errors++;
+        });
+      };
+      // 把每个分组的数据都补充到足够多的水平
+      var moreFeed = function (callback) {
+        feedByGroup.forEach(function (info, index) {
+          if (info.feeds.length > info.errors) return; // 数据还比较多，就不补充了
+          if (!info.more) return; // 不会再有更多的数据了
+          util.debug('home feed generate: get more data for %o', info.gid);
+          loading++;
+          info.more(function (feeds, more) {
+            Array.prototype.push.apply(info.feeds, feeds);
+            checkOrder(info);
+            info.more = feeds.length ? more : null;
+            util.debug('home feed generate: got more data for %o %o', info.gid, info);
+            if (--loading === 0) callback();
+          });
+        });
+        if (loading === 0) callback();
+      };
+      // 从所有现有的数据里面，找一条最新的消息并显示
+      var choseFeed = function () {
+        // 找到最新的微博
+        var max = -Infinity, chosen = null;
+        util.debug('home feed generate: chose feed from %o', feedByGroup);
+        feedByGroup.forEach(function (info) {
+          info.feeds.forEach(function (feed) {
+            if (+feed.date < max) return;
+            max = +feed.date;
+            chosen = feed;
+          });
+        });
+        // 如果没找到，那么直接完成
+        if (max === -Infinity) {
+          util.debug('home feed generate: no more feed');
+          return;
+        }
+        // 首先从现在的候选项里面把找到的微博删掉
+        util.debug('home feed generate: chosen feed', chosen);
+        feedByGroup.forEach(function (info) {
+          info.feeds = info.feeds.filter(function (feed) {
+            return feed.mid !== chosen.mid;
+          });
+        });
+        renderFeed(chosen.dom);
+      };
+      // 逐条获取
+      var nextFeed = function nextFeed(remaind) {
+        util.debug('home feed generate: get next feed ... %o remaining', remaind);
+        if (remaind === 0) return;
+        moreFeed(function () {
+          choseFeed();
+          nextFeed(remaind - 1);
+        });
+      };
+      var renderFeed = function (feed) {
+        // 最后把找到的微博添加到网页中
+        feedlist.appendChild(feed);
+        util.debug('home feed generate: instered feed', feed);
+      }
+    };
   },
 }).addto(filter.groups.base);
 
